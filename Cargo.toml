@@ -1,0 +1,34 @@
+[package]
+name = "mvchat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Proximity voice chat for Magnetite: P2P UDP + Opus + ChaCha20-Poly1305, native Rust mod (side = both)"
+
+[lib]
+name = "mvchat"
+path = "src/lib.rs"
+
+[dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+# Registry dependencies, pinned to the exact versions of the game's own Cargo.lock
+# (crates/horizon-mod-deps / Cargo.lock of the game). Pin them in this mod's Cargo.lock with
+# `horizon-launcher native-lock .` before building. No other crates are used.
+sha2 = "=0.10.9"
+chacha20poly1305 = "=0.10.1"
+rusty-opus = { version = "=1.0.2", optional = true }
+cpal = { version = "=0.16.0", optional = true }
+
+[features]
+# default = ["pc-audio"]: the PC build captures and plays sound through cpal and codes Opus.
+# Without it (the WASM variant, `cargo horizon-mod build --wasm --no-default-features`) the
+# audio backend is a stub and voice goes through the mvchat:voice relay payload.
+default = ["pc-audio"]
+pc-audio = ["opus", "dep:cpal"]
+opus = ["dep:rusty-opus"]
+
+# A mod is its own project, not a member of the game's workspace. The fetched SDK under
+# .horizon/ belongs to the game's workspace, not this one.
+[workspace]
+exclude = [".horizon"]

@@ -1,0 +1,12 @@
+id = "mvchat"
+name = "Magnetite Voice Chat"
+version = "0.1.0"
+description = "Proximity voice chat in the style of Simple Voice Chat: P2P UDP voice between clients, Opus codec, ChaCha20-Poly1305 encryption, Discord-like tap menu. The game server is used for signaling only (secret, roster, hole punching); voice never passes through it."
+authors = ["izrikmizrik"]
+license = "MIT"
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The [native] section (game / horizon / mixins pins) is filled by
+# `cargo horizon-mod new --template native` / `cargo horizon-mod update`; do not write it by hand.
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
