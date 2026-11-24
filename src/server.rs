@@ -63,16 +63,24 @@ pub fn on_about_to_start(_host: &mut dyn ServerHost) {
     st.roster.clear();
     st.addrs.clear();
     st.counter = 1;
-    let port = st.punch_port;
-    match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
-        Ok(socket) => {
-            let _ = socket.set_nonblocking(true);
-            st.socket = Some(socket);
+    // The punch socket is native-only: on wasm the mvchat:voice relay replaces it.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let port = st.punch_port;
+        match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
+            Ok(socket) => {
+                let _ = socket.set_nonblocking(true);
+                st.socket = Some(socket);
+            }
+            Err(e) => {
+                eprintln!("mvchat: cannot bind punch socket on port {port}: {e}");
+                st.socket = None;
+            }
         }
-        Err(e) => {
-            eprintln!("mvchat: cannot bind punch socket on port {port}: {e}");
-            st.socket = None;
-        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        st.socket = None;
     }
 }
 

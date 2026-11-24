@@ -88,7 +88,9 @@ fn multiplayer(host: &dyn ClientHost) -> bool {
 }
 
 /// The punch socket's address: the `voice_server` client config override, else the joined
-/// server's address with the roster's `udp_port`.
+/// server's address with the roster's `udp_port`. Wasm has no sockets — the relay replaces
+/// punching there, so this is always `None` on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_punch(host: &dyn ClientHost, udp_port: u16) -> Option<SocketAddr> {
     let cfg = client_config::get();
     if !cfg.voice_server.is_empty() {
@@ -99,6 +101,12 @@ fn resolve_punch(host: &dyn ClientHost, udp_port: u16) -> Option<SocketAddr> {
     let host_part = host_part.trim_matches(['[', ']']);
     let ip: std::net::IpAddr = host_part.parse().ok()?;
     Some(SocketAddr::new(ip, udp_port))
+}
+
+/// Wasm: no punch socket, the `mvchat:voice` relay carries everything.
+#[cfg(target_arch = "wasm32")]
+fn resolve_punch(_host: &dyn ClientHost, _udp_port: u16) -> Option<SocketAddr> {
+    None
 }
 
 /// `mvchat:roster` handler (client): store the secret and peers, point the engine at the
@@ -288,6 +296,30 @@ impl Hooks for MvChat {
         let mut slot = engine_slot().lock().unwrap();
         if let Some(engine) = slot.as_mut() {
             engine.tick(pose, ptt_down, &settings);
+        }
+        drop(slot);
+        #[cfg(target_arch = "wasm32")]
+        let shared = shared();
+        // Wasm transport: wrap the queued wire packets into mvchat:voice payloads and send
+        // them through the game server (no threads on wasm, so this runs in the tick).
+        #[cfg(target_arch = "wasm32")]
+        {
+            let packets = engine::take_relay_outbox(&shared);
+            if let Some(up) = payloads::VOICE_UP.get() {
+                let you = shared.lock().unwrap().you;
+                for packet in packets {
+                    let mut counter = [0u8; 8];
+                    counter.copy_from_slice(&packet[20..28]);
+                    let value = payloads::VoiceRelay {
+                        from: payloads::Uuid(you),
+                        counter: mod_api::VarLong(u64::from_be_bytes(counter) as i64),
+                        packet,
+                    };
+                    if let Err(e) = up.send(host, &value) {
+                        eprintln!("mvchat: relay send: {e:?}");
+                    }
+                }
+            }
         }
     }
 

@@ -17,16 +17,16 @@ pub mod jitter;
 pub mod net;
 pub mod protocol;
 
-#[cfg(feature = "pc-audio")]
 pub mod audio;
 #[cfg(feature = "opus")]
 pub mod codec;
 
 use crate::engine::crypto::{KEY_LEN, ReplayWindow, pair_key, punch_key};
-#[cfg(feature = "pc-audio")]
 use crate::engine::jitter::FRAME_SAMPLES;
 use crate::engine::jitter::JitterBuffer;
-use crate::engine::net::{ASK_INTERVAL, Datagram, PACER_TICK, PEER_TIMEOUT, PING_INTERVAL};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::engine::net::{ASK_INTERVAL, PACER_TICK, PING_INTERVAL};
+use crate::engine::net::{Datagram, PEER_TIMEOUT};
 use crate::engine::protocol::Pose;
 use crate::engine::protocol::{
     Header, Packet, PacketType, parse_packet, read_addr, write_addr, write_packet,
@@ -125,8 +125,11 @@ pub struct Shared {
     pub pose: Pose,
     /// Outgoing packet counter (monotonic per sender).
     pub counter: u64,
-    /// Raw packets for the pacer to send: (address, bytes).
+    /// Raw packets for the pacer to send: (address, bytes). Native P2P only.
     pub outbox: VecDeque<(SocketAddr, Vec<u8>)>,
+    /// On wasm (no sockets) the same wire packets queue here, wrapped into `mvchat:voice`
+    /// payloads and sent through the game server in the client tick.
+    pub relay_outbox: VecDeque<Vec<u8>>,
     /// Sender half of the inbox: the receive thread (and the wasm relay handler) push here.
     pub inbox_tx: Option<Sender<Datagram>>,
     /// Counters for the menu.
@@ -151,6 +154,7 @@ impl Shared {
             pose: Pose::default(),
             counter: 1,
             outbox: VecDeque::new(),
+            relay_outbox: VecDeque::new(),
             inbox_tx: None,
             rx_datagrams: 0,
             tx_datagrams: 0,
@@ -162,6 +166,23 @@ impl Shared {
         let c = self.counter;
         self.counter += 1;
         c
+    }
+}
+
+/// Where a "confirmed path" points on wasm, where the relay replaces P2P addresses.
+pub const RELAY_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9);
+
+/// Queues one wire packet for sending: P2P address on native, relay payload on wasm.
+fn queue_packet(shared: &mut Shared, addr: SocketAddr, bytes: Vec<u8>) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        shared.outbox.push_back((addr, bytes));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = addr;
+        shared.relay_outbox.push_back(bytes);
     }
 }
 
@@ -180,13 +201,10 @@ pub struct VoiceEngine {
     stop: Arc<AtomicBool>,
     pacer: Option<std::thread::JoinHandle<()>>,
     receiver: Option<std::thread::JoinHandle<()>>,
-    #[cfg(feature = "pc-audio")]
+    #[cfg(feature = "opus")]
     encoder: Option<codec::Encoder>,
-    #[cfg(feature = "pc-audio")]
-    audio: Option<audio::AudioBackend>,
-    #[cfg(feature = "pc-audio")]
+    audio: Option<Box<dyn audio::AudioBackend>>,
     resampler: jitter::Resampler,
-    #[cfg(feature = "pc-audio")]
     framer: jitter::Framer,
 }
 
@@ -215,10 +233,9 @@ impl VoiceEngine {
                     .spawn(move || pacer_loop(socket, shared, stop))
                     .map_err(|e| e.to_string())?
             };
-            #[cfg(feature = "pc-audio")]
+            #[cfg(feature = "opus")]
             let encoder = codec::Encoder::new().ok();
-            #[cfg(feature = "pc-audio")]
-            let audio = audio::AudioBackend::open(None, None).ok();
+            let audio = Some(audio::open(None, None));
             Ok(Self {
                 shared,
                 socket: Some(socket),
@@ -226,30 +243,37 @@ impl VoiceEngine {
                 stop,
                 pacer: Some(pacer),
                 receiver: Some(receiver),
-                #[cfg(feature = "pc-audio")]
+                #[cfg(feature = "opus")]
                 encoder,
-                #[cfg(feature = "pc-audio")]
                 audio,
-                #[cfg(feature = "pc-audio")]
                 resampler: jitter::Resampler::default(),
-                #[cfg(feature = "pc-audio")]
                 framer: jitter::Framer::default(),
             })
         }
         #[cfg(target_arch = "wasm32")]
         {
+            // No threads on wasm: the relay handler feeds the inbox, the tick drains it.
+            let (tx, rx) = channel::<Datagram>();
+            shared.lock().unwrap().inbox_tx = Some(tx);
+            #[cfg(feature = "opus")]
+            let encoder = codec::Encoder::new().ok();
             Ok(Self {
                 shared,
                 socket: None,
-                rx: None,
+                rx: Some(rx),
                 stop: Arc::new(AtomicBool::new(false)),
                 pacer: None,
                 receiver: None,
+                #[cfg(feature = "opus")]
+                encoder,
+                audio: Some(audio::open(None, None)),
+                resampler: jitter::Resampler::default(),
+                framer: jitter::Framer::default(),
             })
         }
     }
 
-    /// Sends BYE to every confirmed peer and stops both threads.
+    /// Sends BYE to every confirmed peer and stops both threads (native).
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         {
@@ -260,21 +284,25 @@ impl VoiceEngine {
                 .filter_map(|(uuid, p)| p.addr.map(|a| (*uuid, a, p.key)))
                 .collect();
             let you = shared.you;
+            for (uuid, addr, key) in &counter_peers {
+                let counter = shared.next_counter();
+                let header = Header {
+                    sender: you,
+                    counter,
+                    kind: PacketType::By,
+                };
+                let mac = crypto::mac8(key, &header, b"");
+                queue_packet(&mut shared, *addr, write_packet(&header, &mac));
+                let _ = uuid;
+            }
             if let Some(socket) = &self.socket {
-                for (uuid, addr, key) in &counter_peers {
-                    let counter = shared.next_counter();
-                    let header = Header {
-                        sender: you,
-                        counter,
-                        kind: PacketType::By,
-                    };
-                    let mac = crypto::mac8(key, &header, b"");
-                    let _ = net::send(socket, *addr, &write_packet(&header, &mac));
-                    let _ = uuid;
+                while let Some((addr, bytes)) = shared.outbox.pop_front() {
+                    let _ = net::send(socket, addr, &bytes);
                 }
             }
             shared.state = EngineState::Off;
             shared.outbox.clear();
+            shared.relay_outbox.clear();
             shared.inbox_tx = None;
         }
         drop(self.rx.take());
@@ -372,7 +400,7 @@ impl VoiceEngine {
                         kind: PacketType::Pong,
                     };
                     let mac = crypto::mac8(&key, &reply, b"");
-                    shared.outbox.push_back((from, write_packet(&reply, &mac)));
+                    queue_packet(shared, from, write_packet(&reply, &mac));
                 }
             }
             PacketType::Voice => {
@@ -432,9 +460,8 @@ impl VoiceEngine {
     }
 
     /// Queues a sealed VOICE packet to every confirmed peer.
-    #[cfg(feature = "pc-audio")]
+    #[cfg(feature = "opus")]
     fn send_voice(shared: &mut Shared, pose: Pose, opus: Vec<u8>) {
-        #[cfg(feature = "opus")]
         {
             let mut plain = Vec::with_capacity(protocol::POSE_LEN + opus.len());
             protocol::write_pose(&mut plain, &pose);
@@ -462,11 +489,8 @@ impl VoiceEngine {
                 }
             }
         }
-        #[cfg(not(feature = "opus"))]
-        let _ = (shared, pose, opus);
     }
 
-    #[cfg(feature = "pc-audio")]
     fn capture_and_send(&mut self, pose: Pose, ptt_down: bool, settings: &Settings, _now: Instant) {
         let Some(audio) = &self.audio else { return };
         let samples = audio.drain_capture();
@@ -513,17 +537,6 @@ impl VoiceEngine {
         }
     }
 
-    #[cfg(not(feature = "pc-audio"))]
-    fn capture_and_send(
-        &mut self,
-        _pose: Pose,
-        _ptt_down: bool,
-        _settings: &Settings,
-        _now: Instant,
-    ) {
-    }
-
-    #[cfg(feature = "pc-audio")]
     fn mix_and_play(&mut self, settings: &Settings, camera: Pose) {
         let Some(audio) = &self.audio else { return };
         let mut shared = self.shared.lock().unwrap();
@@ -577,13 +590,12 @@ impl VoiceEngine {
             audio.push_playback(&out);
         }
     }
-
-    #[cfg(not(feature = "pc-audio"))]
-    fn mix_and_play(&mut self, _settings: &Settings, _camera: Pose) {}
 }
 
-/// The pacer thread: sends the outbox every 20 ms, PINGs unconfirmed candidates every
-/// 500 ms, and ASKs the punch socket every second until answered.
+/// The pacer thread (native only): sends the outbox every 20 ms, PINGs unconfirmed
+/// candidates every 500 ms, and ASKs the punch socket every second until answered.
+/// On wasm there are no threads: the tick drains the relay outbox instead.
+#[cfg(not(target_arch = "wasm32"))]
 fn pacer_loop(socket: Arc<UdpSocket>, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) {
     let mut last_ping = Instant::now() - PING_INTERVAL;
     let mut last_ask = Instant::now() - ASK_INTERVAL;
@@ -661,18 +673,27 @@ pub fn apply_roster(
             continue;
         }
         let key = pair_key(&secret, you, *uuid);
+        // On wasm there is no P2P path to open: every peer is reached through the relay,
+        // so the roster itself confirms the path.
+        #[cfg(target_arch = "wasm32")]
+        let addr = Some(RELAY_ADDR);
+        #[cfg(not(target_arch = "wasm32"))]
+        let addr = None;
         s.peers
             .entry(*uuid)
             .and_modify(|p| {
                 p.name = name.clone();
                 p.key = key;
+                if cfg!(target_arch = "wasm32") {
+                    p.addr = Some(RELAY_ADDR);
+                }
             })
             .or_insert_with(|| Peer {
                 uuid: *uuid,
                 name: name.clone(),
                 key,
                 candidates: Vec::new(),
-                addr: None,
+                addr,
                 replay: ReplayWindow::new(),
                 jitter: JitterBuffer::new(),
                 #[cfg(feature = "opus")]
@@ -689,6 +710,13 @@ pub fn apply_roster(
     }
     s.peers
         .retain(|uuid, _| *uuid == you || entries.iter().any(|(u, _)| u == uuid));
+}
+
+/// Drains the wasm relay outbox: raw wire packets to wrap into `mvchat:voice` payloads.
+pub fn take_relay_outbox(shared: &Arc<Mutex<Shared>>) -> Vec<Vec<u8>> {
+    std::mem::take(&mut shared.lock().unwrap().relay_outbox)
+        .into_iter()
+        .collect()
 }
 
 /// Removes a peer (`mvchat:gone`).
