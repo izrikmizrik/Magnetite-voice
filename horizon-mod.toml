@@ -1,0 +1,11 @@
+id = "mvchat"
+name = "Magnetite Voice Chat"
+version = "0.1.0"
+description = "Proximity voice chat in the style of Simple Voice Chat: voice between clients as encrypted mvchat:voice payloads relayed by the game server (wasm mod, runs on PC, Android and iOS), Opus codec, ChaCha20-Poly1305 encryption, Discord-like tap menu. When the platform adds the microphone hook and its permission, voice goes directly; until then the mod is the signaling/roster/UI/relay skeleton."
+authors = ["izrikmizrik"]
+license = "MIT"
+# A WebAssembly mod: Rust in src/, built to mod.wasm by `cargo horizon-mod build --wasm`
+# (which also writes the [wasm] section — never by hand), beside data/ and assets/.
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
